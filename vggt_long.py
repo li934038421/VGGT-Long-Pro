@@ -43,6 +43,8 @@ import sys
 from loop_utils.config_utils import load_config
 from pathlib import Path
 
+
+
 def remove_duplicates(data_list):
     """
         data_list: [(67, (3386, 3406), 48, (2435, 2455)), ...]
@@ -238,7 +240,9 @@ class VGGT_Long:
             for i in range(num_chunks):
                 start_idx = i * step
                 end_idx = min(start_idx + self.chunk_size, len(self.img_list))
-                self.chunk_indices.append((start_idx, end_idx))
+                self.chunk_indices.append((start_idx, end_idx)
+
+
 
         for chunk_idx in range(len(self.chunk_indices)):
             print(f'[Progress]: {chunk_idx}/{len(self.chunk_indices)-1}')

@@ -8,8 +8,15 @@ Weights:
   DNIO: './weights/dinov2_vitb14_pretrain.pth'
 
 Model:
-  chunk_size: 60
-  overlap: 30
+  # chunk_size: 60
+  # overlap: 30
+  chunk_size: 80
+  overlap: 20
+  min_chunk_size : 40
+  # 新增参数
+  use_dynamic_chunking: True
+  dynamic_thresh: 4.0  # 这里的阈值取决于你选用的计算方法(光流还是差分)，需要调试
+
   loop_chunk_size: 20 # imgs of loop chunk = 2 * loop_chunk_size
   loop_enable: True
   useDBoW: False
