@@ -15,16 +15,90 @@ from vggt.heads.track_head import TrackHead
 
 
 class VGGT(nn.Module, PyTorchModelHubMixin):
-    def __init__(self, img_size=518, patch_size=14, embed_dim=1024):
+    def __init__(
+        self,
+        img_size=518,
+        patch_size=14,
+        embed_dim=1024,
+        enable_camera=True,
+        enable_point=False,
+        enable_depth=True,
+        enable_track=False,
+        merging=0,
+        merge_ratio=0.9,
+        vis_attn_map=False,
+    ):
         super().__init__()
 
-        self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
-        self.camera_head = CameraHead(dim_in=2 * embed_dim)
-        self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1")
-        self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1")
-        self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size)
+        self.vis_attn_map = vis_attn_map
 
-    def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
+        self.aggregator = Aggregator(
+            img_size=img_size,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            merging=merging,
+            merge_ratio=merge_ratio,
+            vis_attn_map=vis_attn_map,
+        )
+
+        self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
+        self.point_head = (
+            DPTHead(
+                dim_in=2 * embed_dim,
+                output_dim=4,
+                activation="inv_log",
+                conf_activation="expp1",
+            )
+            if enable_point
+            else None
+        )
+        self.depth_head = (
+            DPTHead(
+                dim_in=2 * embed_dim,
+                output_dim=2,
+                activation="exp",
+                conf_activation="expp1",
+            )
+            if enable_depth
+            else None
+        )
+        self.track_head = (
+            TrackHead(dim_in=2 * embed_dim, patch_size=patch_size)
+            if enable_track
+            else None
+        )
+
+    def update_patch_dimensions(self, patch_width: int, patch_height: int):
+        """
+        Update patch dimensions for all attention layers in the model
+
+        Args:
+            patch_width: Patch width (typically 37)
+            patch_height: Patch height (typically 28)
+        """
+
+        def update_attention_in_module(module):
+            for name, child in module.named_children():
+                # Recursively update submodules
+                update_attention_in_module(child)
+                # If it is an attention layer, update its patch dimensions
+                if hasattr(child, "patch_width") and hasattr(child, "patch_height"):
+                    child.patch_width = patch_width
+                    child.patch_height = patch_height
+
+        # Update all attention layers in the aggregator
+        update_attention_in_module(self.aggregator)
+
+        # print(
+        #     f"🔧 Updated model attention layer patch dimensions: {patch_width}x{patch_height}"
+        # )
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        query_points: torch.Tensor = None,
+        image_paths: list = None,
+    ):
         """
         Forward pass of the VGGT model.
 
@@ -34,6 +108,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             query_points (torch.Tensor, optional): Query points for tracking, in pixel coordinates.
                 Shape: [N, 2] or [B, N, 2], where N is the number of query points.
                 Default: None
+            image_paths (list, optional): List of image file paths for attention visualization.
+                Only used when vis_attn_map=True. Default: None
 
         Returns:
             dict: A dictionary containing the following predictions:
@@ -49,44 +125,68 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 - vis (torch.Tensor): Visibility scores for tracked points with shape [B, S, N]
                 - conf (torch.Tensor): Confidence scores for tracked points with shape [B, S, N]
         """
-
         # If without batch dimension, add it
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
+
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
+
+        # Save image paths globally for attention visualization
+        if self.vis_attn_map and image_paths is not None:
+            import os
+            import tempfile
+            import pickle
+
+            # Create a temporary file to store image paths
+            temp_dir = tempfile.gettempdir()
+            image_paths_file = os.path.join(temp_dir, "vggt_image_paths.pkl")
+            with open(image_paths_file, "wb") as f:
+                pickle.dump(image_paths, f)
 
         aggregated_tokens_list, patch_start_idx = self.aggregator(images)
 
         predictions = {}
 
-        with torch.cuda.amp.autocast(enabled=False):
-            if self.camera_head is not None:
-                pose_enc_list = self.camera_head(aggregated_tokens_list)
-                predictions["pose_enc"] = pose_enc_list[-1]  # pose encoding of the last iteration
+        if self.camera_head is not None:
+            pose_enc_list = self.camera_head(aggregated_tokens_list)
+            predictions["pose_enc"] = pose_enc_list[
+                -1
+            ]  # pose encoding of the last iteration
+            predictions["pose_enc_list"] = pose_enc_list
 
-            if self.depth_head is not None:
-                depth, depth_conf = self.depth_head(
-                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
-                )
-                predictions["depth"] = depth
-                predictions["depth_conf"] = depth_conf
+        if self.depth_head is not None:
+            depth, depth_conf = self.depth_head(
+                aggregated_tokens_list,
+                images=images,
+                patch_start_idx=patch_start_idx,
+            )
+            predictions["depth"] = depth
+            predictions["depth_conf"] = depth_conf
 
-            if self.point_head is not None:
-                pts3d, pts3d_conf = self.point_head(
-                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
-                )
-                predictions["world_points"] = pts3d
-                predictions["world_points_conf"] = pts3d_conf
+        if self.point_head is not None:
+            pts3d, pts3d_conf = self.point_head(
+                aggregated_tokens_list,
+                images=images,
+                patch_start_idx=patch_start_idx,
+            )
+            predictions["world_points"] = pts3d
+            predictions["world_points_conf"] = pts3d_conf
 
         if self.track_head is not None and query_points is not None:
             track_list, vis, conf = self.track_head(
-                aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx, query_points=query_points
+                aggregated_tokens_list,
+                images=images,
+                patch_start_idx=patch_start_idx,
+                query_points=query_points,
             )
             predictions["track"] = track_list[-1]  # track of the last iteration
             predictions["vis"] = vis
             predictions["conf"] = conf
 
-        predictions["images"] = images
+        if not self.training:
+            predictions["images"] = (
+                images  # store the images for visualization during inference
+            )
 
         return predictions

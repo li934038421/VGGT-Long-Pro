@@ -5,18 +5,15 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from numpy import block
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 from typing import Optional, Tuple, Union, List, Dict, Any
 
 from vggt.layers import PatchEmbed
 from vggt.layers.block import Block
 from vggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from vggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
-import time
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +26,6 @@ class Aggregator(nn.Module):
     The Aggregator applies alternating-attention over input frames,
     as described in VGGT: Visual Geometry Grounded Transformer.
 
-    Remember to set model.train() to enable gradient checkpointing to reduce memory usage.
 
     Args:
         img_size (int): Image size in pixels.
@@ -70,26 +66,15 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
-        global_merging=True,
-        merging=0,
-        merge_ratio=0.9,
-        vis_attn_map=False,
     ):
         super().__init__()
 
-        self.__build_patch_embed__(
-            patch_embed, img_size, patch_size, num_register_tokens, embed_dim=embed_dim
-        )
+        self.__build_patch_embed__(patch_embed, img_size, patch_size, num_register_tokens, embed_dim=embed_dim)
 
         # Initialize rotary position embedding if frequency > 0
-        self.rope = (
-            RotaryPositionEmbedding2D(frequency=rope_freq) if rope_freq > 0 else None
-        )
+        self.rope = RotaryPositionEmbedding2D(frequency=rope_freq) if rope_freq > 0 else None
         self.position_getter = PositionGetter() if self.rope is not None else None
-        self.global_merging = global_merging
-        self.merging = merging
-        self.merge_ratio = merge_ratio
-        self.vis_attn_map = vis_attn_map
+
         self.frame_blocks = nn.ModuleList(
             [
                 block_fn(
@@ -102,7 +87,6 @@ class Aggregator(nn.Module):
                     init_values=init_values,
                     qk_norm=qk_norm,
                     rope=self.rope,
-                    merge_ratio=merge_ratio,
                 )
                 for _ in range(depth)
             ]
@@ -120,7 +104,6 @@ class Aggregator(nn.Module):
                     init_values=init_values,
                     qk_norm=qk_norm,
                     rope=self.rope,
-                    merge_ratio=merge_ratio,
                 )
                 for _ in range(depth)
             ]
@@ -133,18 +116,14 @@ class Aggregator(nn.Module):
 
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
-            raise ValueError(
-                f"depth ({depth}) must be divisible by aa_block_size ({aa_block_size})"
-            )
+            raise ValueError(f"depth ({depth}) must be divisible by aa_block_size ({aa_block_size})")
 
         self.aa_block_num = self.depth // self.aa_block_size
 
         # Note: We have two camera tokens, one for the first frame and one for the rest
         # The same applies for register tokens
         self.camera_token = nn.Parameter(torch.randn(1, 2, 1, embed_dim))
-        self.register_token = nn.Parameter(
-            torch.randn(1, 2, num_register_tokens, embed_dim)
-        )
+        self.register_token = nn.Parameter(torch.randn(1, 2, num_register_tokens, embed_dim))
 
         # The patch tokens start after the camera and register tokens
         self.patch_start_idx = 1 + num_register_tokens
@@ -153,18 +132,9 @@ class Aggregator(nn.Module):
         nn.init.normal_(self.camera_token, std=1e-6)
         nn.init.normal_(self.register_token, std=1e-6)
 
-        # Register normalization constants as buffers (use bf16-compatible tensor)
-        for name, value in (
-            ("_resnet_mean", _RESNET_MEAN),
-            ("_resnet_std", _RESNET_STD),
-        ):
-            self.register_buffer(
-                name,
-                torch.tensor(value, dtype=torch.bfloat16).view(1, 1, 3, 1, 1),
-                persistent=False,
-            )
-
-        self.use_reentrant = False  # hardcoded to False
+        # Register normalization constants as buffers
+        for name, value in (("_resnet_mean", _RESNET_MEAN), ("_resnet_std", _RESNET_STD)):
+            self.register_buffer(name, torch.FloatTensor(value).view(1, 1, 3, 1, 1), persistent=False)
 
     def __build_patch_embed__(
         self,
@@ -184,12 +154,7 @@ class Aggregator(nn.Module):
         """
 
         if "conv" in patch_embed:
-            self.patch_embed = PatchEmbed(
-                img_size=img_size,
-                patch_size=patch_size,
-                in_chans=3,
-                embed_dim=embed_dim,
-            )
+            self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size, in_chans=3, embed_dim=embed_dim)
         else:
             vit_models = {
                 "dinov2_vitl14_reg": vit_large,
@@ -228,53 +193,35 @@ class Aggregator(nn.Module):
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
 
-        # Normalize images and reshape for patch embed - ensure bf16 computation
-        images = images.to(torch.bfloat16)
+        # Normalize images and reshape for patch embed
         images = (images - self._resnet_mean) / self._resnet_std
 
+        # Reshape to [B*S, C, H, W] for patch embedding
         images = images.view(B * S, C_in, H, W)
         patch_tokens = self.patch_embed(images)
-        del images
 
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
 
-        patch_tokens = patch_tokens.to(torch.bfloat16)
-
         _, P, C = patch_tokens.shape
 
         # Expand camera and register tokens to match batch size and sequence length
-        camera_token = slice_expand_and_flatten(
-            self.camera_token.to(torch.bfloat16), B, S
-        )
-        register_token = slice_expand_and_flatten(
-            self.register_token.to(torch.bfloat16), B, S
-        )
+        camera_token = slice_expand_and_flatten(self.camera_token, B, S)
+        register_token = slice_expand_and_flatten(self.register_token, B, S)
 
+        # Concatenate special tokens with patch tokens
         tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
-        tokens = tokens.to(torch.bfloat16)
-        del camera_token, register_token, patch_tokens
-        # Explicitly clean up image data since patch embedding is complete
-        if "images_normalized" in locals():
-            del images_normalized
 
         pos = None
         if self.rope is not None:
-            pos = self.position_getter(
-                B * S, H // self.patch_size, W // self.patch_size, device="cuda"
-            )
+            pos = self.position_getter(B * S, H // self.patch_size, W // self.patch_size, device=images.device)
 
         if self.patch_start_idx > 0:
             # do not use position embedding for special tokens (camera and register tokens)
             # so set pos to 0 for the special tokens
-            pos_original = pos
             pos = pos + 1
-            pos_special = torch.zeros(
-                B * S, self.patch_start_idx, 2, device="cuda", dtype=torch.long
-            )
+            pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to(images.device).to(pos.dtype)
             pos = torch.cat([pos_special, pos], dim=1)
-            # Clean up temporary variables
-            del pos_special, pos_original
 
         # update P because we added special tokens
         _, P, C = tokens.shape
@@ -282,118 +229,31 @@ class Aggregator(nn.Module):
         frame_idx = 0
         global_idx = 0
         output_list = []
-        block4DPT_idx = [4, 11, 17, 23]
-        global_merging = None
 
-        # Set global variables for attention visualization
-        if self.vis_attn_map:
-            import vggt.layers.attention as attn_module
-
-            # Set the global variables that attention.py needs
-            attn_module.vis_attn_map = True
-            attn_module.current_images = self._load_image_paths()  # Load from temp file
-        else:
-            import vggt.layers.attention as attn_module
-
-            attn_module.vis_attn_map = False
-
-        for block_num in range(self.aa_block_num):
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-
-            need_intermediates = True if block_num in block4DPT_idx else False
-            if block_num % 1 == 0:
-                # Clean up RoPE cache to prevent accumulation
-                if hasattr(self, "rope") and self.rope is not None:
-                    if hasattr(self.rope, "frequency_cache"):
-                        self.rope.frequency_cache.clear()
-                # Clean up position cache
-                if (
-                    hasattr(self, "position_getter")
-                    and self.position_getter is not None
-                ):
-                    if hasattr(self.position_getter, "position_cache"):
-                        # Keep only current size cache, clean up others
-                        current_cache = self.position_getter.position_cache.copy()
-                        if (
-                            len(current_cache) > 1
-                        ):  # If there are multiple cache entries
-                            self.position_getter.position_cache.clear()
-                            # Keep only the most recently used one
-                            if current_cache:
-                                key = list(current_cache.keys())[-1]
-                                self.position_getter.position_cache[key] = (
-                                    current_cache[key]
-                                )
-            # Avoid saving block_num to instance variable to reduce references
+        for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
-                    tokens, frame_idx, frame_intermediates = (
-                        self._process_frame_attention(
-                            tokens,
-                            B,
-                            S,
-                            P,
-                            C,
-                            frame_idx,
-                            pos=pos,
-                            need_intermediates=need_intermediates,
-                        )
+                    tokens, frame_idx, frame_intermediates = self._process_frame_attention(
+                        tokens, B, S, P, C, frame_idx, pos=pos
                     )
                 elif attn_type == "global":
-                    if self.merging is None:
-                        global_merging = None
-                    elif self.global_merging and block_num >= self.merging:
-                        global_merging = block_num
-                        # Set attention_map for visualization
-                        if self.vis_attn_map:
-                            import vggt.layers.attention as attn_module
-
-                            attn_module.attention_map = block_num
-                    tokens, global_idx, global_intermediates = (
-                        self._process_global_attention(
-                            tokens,
-                            B,
-                            S,
-                            P,
-                            C,
-                            global_idx,
-                            pos=pos,
-                            global_merging=global_merging,
-                            need_intermediates=need_intermediates,
-                        )
+                    tokens, global_idx, global_intermediates = self._process_global_attention(
+                        tokens, B, S, P, C, global_idx, pos=pos
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
 
-            if block_num not in block4DPT_idx:
-                if "frame_intermediates" in locals():
-                    del frame_intermediates
-                if "global_intermediates" in locals():
-                    del global_intermediates
-            else:
-                concat_inter = torch.cat(
-                    [frame_intermediates[0].detach(), global_intermediates[0].detach()],
-                    dim=-1,
-                )
-                if concat_inter.dtype != torch.bfloat16:
-                    concat_inter = concat_inter.to(torch.bfloat16)
+            for i in range(len(frame_intermediates)):
+                # concat frame and global intermediates, [B x S x P x 2C]
+                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
                 output_list.append(concat_inter)
-                del concat_inter, frame_intermediates, global_intermediates
 
-        # Do final cleanup before returning
-        del tokens, pos
-        if "pos_special" in locals():
-            del pos_special
-        if "pos_original" in locals():
-            del pos_original
-        torch.cuda.empty_cache()  # Final cleanup
-
+        del concat_inter
+        del frame_intermediates
+        del global_intermediates
         return output_list, self.patch_start_idx
 
-    def _process_frame_attention(
-        self, tokens, B, S, P, C, frame_idx, pos=None, need_intermediates=False
-    ):
+    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
         """
         Process frame attention blocks. We keep tokens in shape (B*S, P, C).
         """
@@ -404,29 +264,17 @@ class Aggregator(nn.Module):
         if pos is not None and pos.shape != (B * S, P, 2):
             pos = pos.view(B, S, P, 2).view(B * S, P, 2)
 
-        intermediates = [] if need_intermediates else None
+        intermediates = []
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
             frame_idx += 1
-            if need_intermediates:
-                intermediates.append(tokens.view(B, S, P, C))
+            intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(
-        self,
-        tokens,
-        B,
-        S,
-        P,
-        C,
-        global_idx,
-        pos=None,
-        global_merging=None,
-        need_intermediates=False,
-    ):
+    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
         """
@@ -436,39 +284,15 @@ class Aggregator(nn.Module):
         if pos is not None and pos.shape != (B, S * P, 2):
             pos = pos.view(B, S, P, 2).view(B, S * P, 2)
 
-        intermediates = [] if need_intermediates else None
+        intermediates = []
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
-            tokens = self.global_blocks[global_idx](
-                tokens,
-                pos=pos,
-                global_merging=global_merging,
-            )
+            tokens = self.global_blocks[global_idx](tokens, pos=pos)
             global_idx += 1
-            if need_intermediates:
-                intermediates.append(tokens.view(B, S, P, C))
+            intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, global_idx, intermediates
-
-    def _load_image_paths(self):
-        """Load image paths from temporary file for visualization"""
-        try:
-            import os
-            import tempfile
-            import pickle
-
-            temp_dir = tempfile.gettempdir()
-            image_paths_file = os.path.join(temp_dir, "vggt_image_paths.pkl")
-
-            if os.path.exists(image_paths_file):
-                with open(image_paths_file, "rb") as f:
-                    return pickle.load(f)
-            else:
-                return []
-        except Exception as e:
-            print(f"Warning: Could not load image paths for visualization: {e}")
-            return []
 
 
 def slice_expand_and_flatten(token_tensor, B, S):
@@ -485,6 +309,7 @@ def slice_expand_and_flatten(token_tensor, B, S):
         torch.Tensor: Processed tokens with shape (B*S, X, C)
     """
 
+    # Slice out the "query" tokens => shape (1, 1, ...)
     query = token_tensor[:, 0:1, ...].expand(B, 1, *token_tensor.shape[2:])
     # Slice out the "other" tokens => shape (1, S-1, ...)
     others = token_tensor[:, 1:, ...].expand(B, S - 1, *token_tensor.shape[2:])
