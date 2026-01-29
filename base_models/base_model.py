@@ -187,6 +187,57 @@ class VGGTAdapter(Base3DModel):
             'images': predictions["images"],
             'mask': None
         }
+        
+        
+        
+        # ===================== FastVGGT Adapter =====================
+# Adapts the accelerated VGGT (FastVGGT) to the unified interface.
+# =======================================================
+
+class FastVGGTAdapter(VGGTAdapter):  # 1. 直接继承 VGGTAdapter，复用 infer_chunk
+    def load(self):
+        """Load FastVGGT model with token merging enabled."""
+        print('Loading FastVGGT model (with acceleration)...')
+        
+        # === 关键点 1: 导入你新复制的 FastVGGT 类 ===
+        # 假设你按照我之前的建议，把 mystorm16 的代码放在了项目根目录的 vggt 文件夹下
+        # 这里的路径根据你实际放代码的位置调整
+        try:
+            from base_models.vggt.models.vggt import VGGT as FastVGGTClass
+        except ImportError:
+            # 如果你把它放在了 base_models 下，请用这个：
+            from base_models.vggt.models.vggt import VGGT as FastVGGTClass
+
+        # === 关键点 2: 读取配置并注入加速参数 ===
+        # 我们尝试从 config 中读取 merge_ratio，如果没有就默认 0.5
+        merge_ratio = self.config.get('Model', {}).get('merge_ratio', 0.5)
+        print(f"Initializing FastVGGT with merge_ratio: {merge_ratio}")
+
+        # 初始化模型
+        # 注意：这里我们传入 merge_ratio。
+        # 如果原版 VGGT() 是无参初始化，而新版需要参数，你需要确认新版 __init__ 的签名。
+        # 通常 mystorm16 的实现需要传入 dim 等参数，或者它有默认值。
+        # 这里假设它兼容或者使用了默认配置。
+        self.model = FastVGGTClass(
+            # 如果 FastVGGT 需要显式传参，你可能需要加上：
+            # dim=self.config['Model']['dim'],
+            # depth=self.config['Model']['depth'],
+            merge_ratio=merge_ratio  # <--- 核心加速参数
+        )
+
+        # === 关键点 3: 加载权重 ===
+        # 权重通常是通用的，可以直接加载原版 VGGT 的权重
+        url = self.config['Weights']['VGGT']
+        print(f"Loading weights from: {url}")
+        state_dict = torch.load(url, map_location='cuda')
+
+        # strict=False 非常重要，因为 FastVGGT 可能多了一些辅助参数（如 buffer），或者少了一些层
+        self.model.load_state_dict(state_dict, strict=False)
+        
+        self.model.eval()
+        self.model = self.model.to(self.device)
+
+    # infer_chunk 不需要重写，直接继承父类的逻辑
 
 
 # ===================== Pi3 Adapter =====================
@@ -388,3 +439,5 @@ class MapAnythingAdapter(Base3DModel):
             'images': process_tensor('images').permute(0, 3, 1, 2).unsqueeze(0),
             'mask': process_tensor('mask').unsqueeze(0)
         }
+
+

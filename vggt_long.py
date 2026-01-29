@@ -25,7 +25,7 @@ except ImportError:
 from LoopModels.LoopModel import LoopDetector
 from LoopModelDBoW.retrieval.retrieval_dbow import RetrievalDBOW
 
-from base_models.base_model import VGGTAdapter,Pi3Adapter,MapAnythingAdapter
+from base_models.base_model import VGGTAdapter,Pi3Adapter,MapAnythingAdapter, FastVGGTAdapter
 
 import numpy as np
 
@@ -131,6 +131,9 @@ class VGGT_Long:
             self.model = Pi3Adapter(self.config)
         elif self.config['Weights']['model'] == 'Mapanything':
             self.model = MapAnythingAdapter(self.config)
+        elif self.config['Weights']['model'] == 'FastVGGT':
+            self.model = FastVGGTAdapter(self.config)
+            
         else:
             raise ValueError(f"Unsupported model: {self.config['Weights']['model']}. ")
 
