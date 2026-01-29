@@ -240,7 +240,7 @@ class VGGT_Long:
             for i in range(num_chunks):
                 start_idx = i * step
                 end_idx = min(start_idx + self.chunk_size, len(self.img_list))
-                self.chunk_indices.append((start_idx, end_idx)
+                self.chunk_indices.append((start_idx, end_idx))
 
 
 
