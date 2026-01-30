@@ -287,13 +287,13 @@ class Aggregator(nn.Module):
 
         # Set global variables for attention visualization
         if self.vis_attn_map:
-            import vggt.layers.attention as attn_module
+            import base_models.vggt.layers.attention as attn_module
 
             # Set the global variables that attention.py needs
             attn_module.vis_attn_map = True
             attn_module.current_images = self._load_image_paths()  # Load from temp file
         else:
-            import vggt.layers.attention as attn_module
+            import base_models.vggt.layers.attention as attn_module
 
             attn_module.vis_attn_map = False
 
