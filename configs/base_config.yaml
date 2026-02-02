@@ -1,5 +1,5 @@
 Weights:
-  model: 'VGGT' # choose between 'VGGT'  'FastVGGT' or 'Pi3' or 'Mapanything'
+  model: 'FastVGGT' # choose between 'VGGT'  'FastVGGT' or 'Pi3' or 'Mapanything'
   VGGT: './weights/model.pt'
   Pi3: './weights/Pi3/model.safetensors'
   Map:  './weights/map_anything'
@@ -31,7 +31,7 @@ Model:
   calib: False # Only available when using MapAnything
   h: 376 # Input h
   w: 1241 # Input w
-  merge_ratio: 0.7
+  merge_ratio: 0.5
 
 
   IRLS:

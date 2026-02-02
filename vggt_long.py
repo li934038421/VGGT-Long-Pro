@@ -101,6 +101,7 @@ class VGGT_Long:
 
         self.chunk_size = self.config['Model']['chunk_size']
         self.overlap = self.config['Model']['overlap']
+        self.merge_ratio = self.config['Model']['merge_ratio']
         self.seed = 42
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
