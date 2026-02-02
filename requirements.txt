@@ -17,3 +17,8 @@ prettytable
 pytorch-lightning
 pytorch-metric-learning
 torchmetrics
+
+opencv-python-headless
+pypose
+trimesh
+matplotlib
