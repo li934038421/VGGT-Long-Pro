@@ -89,6 +89,20 @@ class VGGTAdapter(Base3DModel):
         # Load images and preprocess them into a tensor: [B, 3, H, W]
         images = load_and_preprocess_images(image_paths).to(self.device)
         print(f"Loaded {len(images)} images")
+        print(f"Debug: Final images shape: {images.shape}") # 建议打印出来确认一下
+        # =======================================================
+        # [核心修复] 根据当前图片的实际尺寸，更新 FastVGGT 的网格参数
+        # =======================================================
+        _, _, H, W = images.shape
+        patch_h = H // 14  # 假设 patch_size 是 14
+        patch_w = W // 14
+        print(f"Debug: patch_h: {patch_h}   patch_w: {patch_w}") # 建议打印出来确认一下
+        
+        # 这一步至关重要！告诉 Aggregator 现在的网格是 28x37 还是 37x37
+        if hasattr(self.model, "update_patch_dimensions"):
+            self.model.update_patch_dimensions(patch_w, patch_h)
+            # print(f"Updated patch dims to: {patch_w}x{patch_h}")
+        # =======================================================
 
         assert len(images.shape) == 4
         assert images.shape[1] == 3
@@ -171,7 +185,7 @@ class VGGTAdapter(Base3DModel):
         extrinsic_homo = torch.cat([extrinsic, ones], dim=2)
 
         # Inverse to get C2W
-        predictions["extrinsic"] = torch.inverse(extrinsic_homo)
+        predictions["extrinsic"] = torch.inverse(extrinsic_homo.float())
         predictions["intrinsic"] = intrinsic
         ##point : torch.Size([1, 60, 154, 518, 3])
         ##conf : torch.Size([1, 60, 154, 518])
@@ -219,9 +233,10 @@ class FastVGGTAdapter(VGGTAdapter):  # 1. 直接继承 VGGTAdapter，复用 infe
         # 通常 mystorm16 的实现需要传入 dim 等参数，或者它有默认值。
         # 这里假设它兼容或者使用了默认配置。
         self.model = FastVGGTClass(
-            # 如果 FastVGGT 需要显式传参，你可能需要加上：
-            # dim=self.config['Model']['dim'],
-            # depth=self.config['Model']['depth'],
+            enable_camera=True,
+            enable_depth=True,  # 禁用深度头以提速
+            enable_point=True,  # 禁用点云头
+            merging=1,           # 开启合并逻辑 # 合并比例
             merge_ratio=merge_ratio  # <--- 核心加速参数
         )
 
